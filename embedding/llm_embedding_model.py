@@ -1,26 +1,41 @@
 import numpy as np
-import requests
+import os
+from .llm_providers import get_embedding_provider
 
-# Configuration for the Ollama model API
-OLLAMA_HOST = "http://192.168.0.225:11434"  # Adjust the port if necessary
-MODEL_NAME = "nomic-embed-text"  # Replace with your actual model name
+# Legacy configuration for backward compatibility
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://192.168.0.225:11434")
+MODEL_NAME = os.environ.get("OLLAMA_MODEL", "nomic-embed-text")
 
-def get_llm_embedding(text):
+# Create a default provider instance
+_default_provider = None
+
+def get_llm_embedding(text, provider_name="ollama", **kwargs):
     """
-    Calls the Ollama model API to get an embedding for the input text.
-    Assumes the API endpoint is available at {OLLAMA_HOST}/embed and that it expects
-    a JSON payload with "model" and "text" keys, returning a JSON with an "embedding" key.
+    Get an embedding for the input text using the specified provider.
+    
+    For backward compatibility, defaults to Ollama with legacy configuration.
+    
+    Args:
+        text: The text to embed
+        provider_name: Name of the provider to use (ollama, openai, anthropic, etc.)
+        **kwargs: Additional configuration for the provider
     """
-    endpoint = f"{OLLAMA_HOST}/api/embeddings"
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": text
-    }
-    response = requests.post(endpoint, json=payload)
-    response.raise_for_status()  # Raise an error for bad status codes.
-    data = response.json()
-    embedding = data.get("embedding")
-    if embedding is None:
-        raise ValueError("No 'embedding' key found in the response.")
-    return np.array(embedding)
+    global _default_provider
+    
+    # Use cached provider if no custom config provided
+    if not kwargs and provider_name == "ollama" and _default_provider:
+        return _default_provider.get_embedding(text)
+    
+    # Create provider with configuration
+    if provider_name == "ollama" and not kwargs:
+        # Use legacy configuration for backward compatibility
+        kwargs = {"host": OLLAMA_HOST, "model": MODEL_NAME}
+    
+    provider = get_embedding_provider(provider_name, **kwargs)
+    
+    # Cache default Ollama provider
+    if not kwargs and provider_name == "ollama" and not _default_provider:
+        _default_provider = provider
+    
+    return provider.get_embedding(text)
 

@@ -1,0 +1,47 @@
+# Example configuration for LLM providers
+
+# Ollama (local)
+ollama:
+  host: "http://localhost:11434"
+  model: "nomic-embed-text"
+  # Other models: mxbai-embed-large, all-minilm, etc.
+
+# OpenAI
+openai:
+  api_key: "sk-..."  # Or set OPENAI_API_KEY env var
+  model: "text-embedding-3-small"
+  # Models: text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002
+
+# Anthropic/Voyage
+voyage:
+  api_key: "..."  # Or set VOYAGE_API_KEY env var
+  model: "voyage-2"
+  # Models: voyage-2, voyage-large-2, voyage-code-2
+
+# HuggingFace
+huggingface:
+  api_key: "hf_..."  # Or set HUGGINGFACE_API_KEY env var
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  # Many models available on HuggingFace Hub
+
+# Cohere
+cohere:
+  api_key: "..."  # Or set COHERE_API_KEY env var
+  model: "embed-english-v3.0"
+  # Models: embed-english-v3.0, embed-multilingual-v3.0, embed-english-light-v3.0
+
+# CLI usage examples:
+
+# Using Ollama (default):
+# semnet-import embed --input-dir ./data/imported --output-dir ./data/embeddings \
+#   --integration chatlog --method llm
+
+# Using OpenAI:
+# semnet-import embed --input-dir ./data/imported --output-dir ./data/embeddings \
+#   --integration chatlog --method llm --llm-provider openai \
+#   --llm-config '{"model": "text-embedding-3-large"}'
+
+# Using environment variables:
+# export OPENAI_API_KEY="sk-..."
+# semnet-import embed --input-dir ./data/imported --output-dir ./data/embeddings \
+#   --integration chatlog --method llm --llm-provider openai

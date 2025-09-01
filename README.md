@@ -4,11 +4,17 @@ A toolkit for generating, analyzing, and visualizing complex networks from conve
 
 ## Features
 
+- **Plugin-Based Data Integration**:
+  - Extensible integration system for various data sources
+  - Built-in support for chat logs (JSON, Markdown), bookmarks, playlists
+  - Easy to add custom integrations
+
 - **Flexible Embedding Generation**:
-  - LLM embedding support via Ollama API
-  - TF-IDF embeddings for classical NLP approach
-  - Role-based aggregation (separate embeddings for users vs assistants)
-  - Automatic chunking for long messages
+  - Multiple LLM providers: Ollama (local), OpenAI, Anthropic/Voyage, HuggingFace, Cohere
+  - Memory-efficient TF-IDF for large datasets
+  - Advanced chunking strategies (sliding window, sentence, paragraph)
+  - Role-based weighting for conversations
+  - Configurable aggregation methods (mean, weighted, PCA, max-pool)
 
 - **Graph Generation**:
   - Generate edges based on cosine similarity between node embeddings
@@ -30,50 +36,77 @@ A toolkit for generating, analyzing, and visualizing complex networks from conve
 
 ```bash
 # Clone the repository
-git clone https://github.com/queelius/chatgpt-complex-net.git
-cd chatgpt-complex-net
+git clone https://github.com/queelius/llm-semantic-net.git
+cd llm-semantic-net
 
-# Install dependencies
-pip install -r requirements.txt
+# Install as package
+pip install -e .
+
+# For development (includes testing tools)
+pip install -e ".[dev]"
+# Or:
+pip install -r requirements-dev.txt
 ```
+
+After installation, the following commands become available:
+- `semnet` - Main CLI for integration-based semantic network generation
+- `semnet-rec` - Recommendation system
 
 ## Usage
 
-### Generating Node Embeddings
+### Quick Start
 
 ```bash
-# Generate role-based embeddings using LLM model
-python cli.py node-embeddings --input-dir ./data/conversations \
-    --method role-aggregate --embedding-method llm
+# List available integrations
+semnet list
+
+# Import your data (e.g., JSON chat logs)
+semnet import --integration chatlog.json \
+    --source ./data/conversations --output-dir ./data/imported
+
+# Generate embeddings (with separate storage)
+semnet embed --input-dir ./data/imported \
+    --output-dir ./data/embeddings \
+    --integration chatlog --method llm
+
+# Create edges and export
+semnet edges --input-dir ./data/embeddings \
+    --output-file edges.json --threshold 0.7
     
-# Generate chunked embeddings for large documents
-python cli.py node-embeddings --input-dir ./data/conversations \
-    --method chunked --chunk-size 512
+semnet export --nodes-dir ./data/imported \
+    --edges-file edges.json --format gexf --output-file graph.gexf
 ```
 
-### Creating Graph Edges
+### Advanced Embedding Options
 
 ```bash
-# Generate edges (CPU version)
-python cli.py edges --input-dir ./data/embeddings_json \
-    --output-file edges.json
+# Use OpenAI embeddings
+semnet embed --input-dir ./data/imported \
+    --output-dir ./data/embeddings \
+    --integration chatlog --method llm \
+    --llm-provider openai \
+    --llm-config '{"model": "text-embedding-3-large"}'
 
-# GPU-accelerated edge generation
-python cli.py edges-gpu --input-dir ./data/embeddings_json \
-    --output-file edges.json
-
-# Filter edges by similarity threshold
-python cli.py cut-off --input-file edges.json \
-    --output-file filtered_edges.json --cutoff 0.7
+# Chunked embeddings with role weighting
+semnet embed --input-dir ./data/imported \
+    --output-dir ./data/embeddings \
+    --integration chatlog --method llm \
+    --chunk-size 1024 --chunk-overlap 100 \
+    --aggregation-method weighted_mean \
+    --role-weights '{"user": 1.5, "assistant": 1.0}'
 ```
 
-### Exporting and Visualization
+### GPU-Accelerated Edge Generation
+
+For large datasets, you can use GPU acceleration for edge generation:
 
 ```bash
-# Export to Gephi-compatible format
-python cli.py export --nodes-dir ./data/embeddings_json \
-    --edges-file filtered_edges.json --format gexf \
-    --output-file graph.gexf
+# Install PyTorch with CUDA support first
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Then use the GPU edge generation module
+python graph/gpu-edge.py --input-dir ./data/embeddings \
+    --output-file edges_gpu.json
 ```
 
 ### Recommendation System
@@ -90,20 +123,67 @@ python rec-conv.py --nodes-dir ./data/embeddings_json \
 
 ## Project Structure
 
-- cli.py - Command-line interface for all operations
-- networks.py - Core network generation functionality
-- rec-conv.py - Recommendation system
-- graph - Graph processing utilities
-  - edge_utils.py - Edge generation and filtering
-  - export_utils.py - Graph format conversion
-  - normalization.py - Vector normalization utilities
-  - gpu-edge.py - GPU-accelerated edge generation
-- embedding - Embedding generation
-  - llm_embedding_model.py - LLM-based embeddings
-  - tdidf_embedding_model.py - Classical TF-IDF embeddings
-  - utils.py - Text chunking and processing
-- data - Data processing
-  - message_utils.py - Message formatting utilities
+```
+├── cli.py                     # Main CLI with integration support
+├── rec_conv.py                # Recommendation system
+├── integrations/             # Plugin-based data integrations
+│   ├── base.py              # Abstract base classes
+│   ├── chatlog/             # Chat log integrations
+│   ├── bookmarks/           # Bookmark integrations
+│   └── playlist/            # Playlist integrations
+├── embedding/                # Embedding generation
+│   ├── llm_providers.py     # Multiple LLM provider support
+│   ├── chunking.py          # Advanced chunking strategies
+│   ├── tfidf_memory_efficient.py  # Memory-efficient TF-IDF
+│   └── llm_embedding_model.py     # Legacy Ollama support
+├── graph/                    # Graph processing
+│   ├── edge_utils.py        # Edge generation
+│   ├── export_utils.py      # Export to various formats
+│   └── gpu-edge.py          # GPU acceleration
+├── tests/                    # Test suite
+│   ├── test_core/           # Core functionality tests
+│   ├── test_embedding/      # Embedding tests
+│   ├── test_integrations/   # Integration tests
+│   └── conftest.py          # Shared fixtures
+└── config.example.yaml       # Configuration examples
+```
+
+## Testing
+
+```bash
+# Run all tests
+pytest
+
+# Run with coverage report
+pytest --cov
+
+# Run specific test categories
+pytest -m unit           # Unit tests only
+pytest -m integration    # Integration tests only
+
+# Generate HTML coverage report
+pytest --cov --cov-report=html
+```
+
+## Configuration
+
+### Environment Variables
+
+Set these environment variables for different LLM providers:
+
+```bash
+# Ollama (local)
+export OLLAMA_HOST="http://localhost:11434"
+export OLLAMA_MODEL="nomic-embed-text"
+
+# OpenAI
+export OPENAI_API_KEY="sk-..."
+
+# Other providers
+export VOYAGE_API_KEY="..."        # Anthropic/Voyage
+export HUGGINGFACE_API_KEY="..."
+export COHERE_API_KEY="..."
+```
 
 ## License
 

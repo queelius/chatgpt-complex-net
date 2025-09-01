@@ -1,340 +1,294 @@
 #!/usr/bin/env python3
+"""
+Refactored CLI using the semantic network API.
+This is a thin wrapper around the semnet_api module.
+"""
+
 import os
 import sys
-import json
 import argparse
-import networks
-import ast
-import numpy as np
-import glob
-from tqdm import tqdm
 import logging
-from graph.normalization import check_embeddings_normalized, normalize_node_embeddings
-from graph.edge_utils import generate_edges_from_node_embeddings, filter_edges
-from embedding.utils import chunk_text
-from graph.export_utils import export_to_network_format
+import json
+import tempfile
+import shutil
+from pathlib import Path
+from typing import Dict, Any
 
+import semnet_api as api
+from integrations import discover_integrations, IntegrationRegistry
+
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
+logger = logging.getLogger(__name__)
 
-def clean_embeddings(input_dir, embedding_root="embeddings", embedding_type=None):
-    """
-    Remove embeddings from JSON files.
-    If embedding_type is None, remove the entire embedding_root tree.
-    Otherwise, remove only the specified type under the root.
-    """
-    if not os.path.isdir(input_dir):
-        logging.error(f"Input directory does not exist or is not a directory: {input_dir}")
-        sys.exit(1)
-    file_paths = glob.glob(os.path.join(input_dir, "*.json"))
-    for file_path in tqdm(file_paths, desc="Cleaning embeddings"):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if embedding_root in data:
-                if embedding_type:
-                    if embedding_type in data[embedding_root]:
-                        del data[embedding_root][embedding_type]
-                        logging.info(f"Removed {embedding_type} from {file_path}")
-                else:
-                    del data[embedding_root]
-                    logging.info(f"Removed all embeddings under '{embedding_root}' from {file_path}")
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logging.error(f"Failed to clean {file_path}: {e}")
 
-def validate_json_files(input_dir):
-    """
-    Check all .json files in input_dir for JSON validity.
-    Prints any files that are invalid.
-    """
-    import glob
-    import json
-    import os
+def cmd_list_integrations(args):
+    """List all available integrations."""
+    discovered = discover_integrations()
+    print(f"\nAvailable integrations ({len(discovered)}):")
+    for name in sorted(discovered):
+        integration_class = IntegrationRegistry.get(name)
+        if integration_class:
+            doc = integration_class.__doc__.strip() if integration_class.__doc__ else 'No description'
+            print(f"  - {name}: {doc}")
 
-    if not os.path.isdir(input_dir):
-        print(f"Directory does not exist: {input_dir}")
-        return
 
-    file_paths = glob.glob(os.path.join(input_dir, "*.json"))
-    invalid_files = []
-    for file_path in tqdm(file_paths, desc="Validating JSON files"):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                json.load(f)
-        except Exception as e:
-            print(f"Invalid JSON: {file_path} ({e})")
-            invalid_files.append(file_path)
-    if not invalid_files:
-        print("All JSON files are valid.")
-    else:
-        print(f"\n{len(invalid_files)} invalid JSON file(s) found.")
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Graph tool: generate complex networks based off en embedding model to generate edges based on some notion of semantic similarity. We also provide a means to export to commnon graph formats."
+def cmd_import(args):
+    """Import data using a specific integration."""
+    config = json.loads(args.config) if args.config else None
+    
+    # Use the API to import data
+    nodes = api.import_data(
+        integration=args.integration,
+        source=args.source,
+        output_dir=args.output_dir,
+        config=config
     )
     
-    subparsers = parser.add_subparsers(
-        dest="command", help="Subcommand to run")
-
-    # Subcommand: Generate node embeddings.
-    parser_emb = subparsers.add_parser("node-embeddings", help="Generate node embeddings from a directory of JSON documents")
-    parser_emb.add_argument("--input-dir", "-i", required=True, help="Directory containing JSON documents.")
-    parser_emb.add_argument("--method", "-m", choices=["chunked", "role-aggregate"], default="chunked", 
-        help="Embedding method: chunked (transcript, with chunking) or role-aggregate (per-role, with optional chunking).")
-    parser_emb.add_argument("--user-weight", "-u", type=float, default=1.5, 
-        help="Weight for user messages when using role-aggregate method")
-    parser_emb.add_argument("--assistant-weight", "-a", type=float, default=1.0, 
-        help="Weight for assistant messages when using role-aggregate method")
-    parser_emb.add_argument("--role-config", type=str, default=None,
-        help="JSON string or path to JSON file specifying roles and weights, e.g. '{\"user\": {\"weight\": 1.5}, \"assistant\": {\"weight\": 1.0}}'")
-    parser_emb.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-    parser_emb.add_argument("--embedding-method", "-e", choices=["llm", "tfidf"], default="llm",
-        help="Embedding method: 'llm' (default, uses LLM API) or 'tfidf' (classical TF-IDF).")
-    parser_emb.add_argument("--chunk-size", type=int, default=2000,
-        help="Chunk size (in words) for chunked methods. Use a large value for no chunking.")
-    parser_emb.add_argument("--chunk-overlap", type=int, default=0,
-        help="Number of words to overlap between chunks (default: 0).")
-    parser_emb.add_argument("--chunk-aggregation", type=str, choices=["mean", "sum"], default="mean",
-        help="How to aggregate chunk embeddings: mean or sum (default: mean).")
-    parser_emb.add_argument("--valid-roles", type=str, default=None,
-        help="Comma-separated list of roles to include (e.g. 'user,assistant'). Applies to chunked method.")
-
-    # Subcommand: Normalize node embeddings.
-    parser_norm = subparsers.add_parser("normalize", help="Normalize node embeddings to unit length.")
-    parser_norm.add_argument("--input-dir", "-i", required=True, help="Directory containing JSON documents.")
-    parser_norm.add_argument("--output-dir", "-o", required=False, default=None,
-                          help="Directory to store the normalized embeddings in. If not specified, files are overwritten in place.")
-    parser_norm.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-
-    # Subcommand: Generate edges.
-    parser_edges = subparsers.add_parser("edges", help="Generate graph edges from node embeddings.")
-    parser_edges.add_argument("--input-dir", "-i", required=True, help="Directory containing the JSON documents.")
-    parser_edges.add_argument("--output-file", "-o", required=True, help="JSON file to store the edges.")
-    parser_edges.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-    parser_edges.add_argument("--embedding-type", type=str, default="role_aggregate",
-        help="Embedding type under the root key (default: 'role_aggregate').")
-
-    # Subcommand: Generate edges using GPU.
-    parser_edges_gpu = subparsers.add_parser("edges-gpu", help="Generate graph edges from node embeddings using GPU acceleration (PyTorch).")
-    parser_edges_gpu.add_argument("--input-dir", "-i", required=True, help="Directory containing the JSON documents.")
-    parser_edges_gpu.add_argument("--output-file", "-o", required=True, help="JSON file to store the edges.")
-    parser_edges_gpu.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-    parser_edges_gpu.add_argument("--embedding-type", type=str, default="role_aggregate",
-        help="Embedding type under the root key (default: 'role_aggregate').")
-
-    # Subcommand: Filter edges.
-    parser_filter = subparsers.add_parser("cut-off", help="Remove edges based below the cut-off.")
-    parser_filter.add_argument("--input-file", "-i", required=True, help="JSON file containing edges.")
-    parser_filter.add_argument("--output-file", "-o", required=True, help="Output JSON file.")
-    parser_filter.add_argument("--cutoff", "-c", type=float, required=True,
-                               help="Edges with a similarity value below the cut-off will be removed.")
+    # Handle edge extraction if requested
+    if args.extract_edges:
+        importer = api.DataImporter(args.integration, config)
+        importer.load(args.source)
+        edges = importer.extract_edges()
+        
+        if edges:
+            edges_file = Path(args.output_dir) / "edges.json"
+            api.Storage.save_edges(edges, edges_file)
+            logger.info(f"Saved {len(edges)} edges to {edges_file}")
     
-    # Subcommand: Rescale
-    edge_rescale = subparsers.add_parser("edge-rescale", help="Rescale edge similarity scores to range [min, max].")
-    edge_rescale.add_argument("--input", "-i", required=True, help="JSON file containing the edges.")
-    edge_rescale.add_argument("--output", "-o", required=True, help="JSON file where the the filtered edges are stored.")
-    edge_rescale.add_argument("--max", type=float, required=False, default=1.0,
-                               help="Maximum similarity score.")
-    edge_rescale.add_argument("--min", type=float, required=False, default=0.25,
-                               help="Minimum similarity score.")
-
-    # Subcommand: Export graph.
-    parser_export = subparsers.add_parser("export", help="Export nodes and edges to a standard graph format for network analysis.")
-    parser_export.add_argument("--nodes-dir", "-n", required=True, help="Directory containing JSON documents with node embeddings.")
-    parser_export.add_argument("--edges-file", "-e", required=True, help="Input edges JSON file.")
-    parser_export.add_argument("--format", "-f", required=True,
-                               help="Output format (gexf for Gephi, graphml, or gml).", choices=["gexf", "graphml", "gml"])
-    parser_export.add_argument("--output-file", "-o", required=True, help="Output file name.")
-
-    # Subcommand: Check if embeddings are normalized.
-    parser_isnorm = subparsers.add_parser("is-normalized", help="Check if all embedding vectors are unit length.")
-    parser_isnorm.add_argument("--input-dir", "-i", required=True, help="Directory containing JSON documents.")
-    parser_isnorm.add_argument("--tol", type=float, default=1e-4, help="Tolerance for norm check (default: 1e-4)")
-    parser_isnorm.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-
-    # Subcommand: Clean embeddings.
-    parser_clean = subparsers.add_parser("clean-embeddings", help="Remove embeddings from JSON files.")
-    parser_clean.add_argument("--input-dir", "-i", required=True, help="Directory containing JSON documents.")
-    parser_clean.add_argument("--embedding-root", type=str, default="embeddings",
-        help="Root key for embeddings in JSON (default: 'embeddings').")
-    parser_clean.add_argument("--embedding-type", type=str, default=None,
-        help="Embedding type under the root key to remove (default: remove all under root).")
-
-    # Subcommand: Test chunking.
-    parser_chunk = subparsers.add_parser("test-chunking", help="Test chunking of text.")
-    parser_chunk.add_argument("--text", type=str, help="Text to chunk.")
-    parser_chunk.add_argument("--file", type=str, help="File containing text to chunk.")
-    parser_chunk.add_argument("--chunk-size", type=int, default=2000, help="Chunk size (in words).")
-    parser_chunk.add_argument("--overlap", type=int, default=0, help="Number of words to overlap between chunks.")
+    # Save statistics
+    stats = {
+        'node_count': len(nodes),
+        'integration': args.integration,
+        'source': args.source
+    }
+    if args.extract_edges:
+        stats['edge_count'] = len(edges) if 'edges' in locals() else 0
     
-    # Subcommand: Validate JSON files.
-    parser_validate = subparsers.add_parser("validate-json", help="Check all JSON files in a directory for validity.")
-    parser_validate.add_argument("--input-dir", "-i", required=True, help="Directory containing JSON files to validate.")
+    stats_file = Path(args.output_dir) / "import_stats.json"
+    with open(stats_file, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2, default=str)
+    
+    logger.info(f"Import complete. Saved {len(nodes)} nodes to {args.output_dir}")
 
+
+def cmd_embed(args):
+    """Generate embeddings for imported nodes."""
+    # Parse configuration
+    llm_config = json.loads(args.llm_config) if args.llm_config else {}
+    
+    # Load nodes
+    nodes = api.Storage.load_nodes(Path(args.input_dir))
+    
+    # Create importer for content extraction
+    importer = api.DataImporter(args.integration)
+    
+    # Generate embeddings using the API
+    generator = api.EmbeddingGenerator(api.EmbeddingMethod(args.method))
+    
+    if args.method == 'tfidf':
+        embeddings = generator.generate_tfidf_embeddings(
+            nodes=nodes,
+            content_extractor=importer.get_node_content_for_embedding,
+            max_features=args.max_features,
+            batch_size=args.batch_size
+        )
+    elif args.method == 'llm':
+        embeddings = generator.generate_llm_embeddings(
+            nodes=nodes,
+            content_extractor=importer.get_node_content_for_embedding,
+            provider=args.llm_provider,
+            config=llm_config,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap
+        )
+    else:
+        raise ValueError(f"Unknown embedding method: {args.method}")
+    
+    # Save embeddings
+    api.Storage.save_embeddings(embeddings, Path(args.output_dir))
+    logger.info(f"Generated {len(embeddings)} embeddings")
+
+
+def cmd_edges(args):
+    """Generate edges based on embeddings."""
+    # Use the API to compute edges
+    edges = api.compute_edges(
+        input_dir=args.input_dir,
+        output_file=args.output_file,
+        threshold=args.threshold
+    )
+    logger.info(f"Generated {len(edges)} edges")
+
+
+def cmd_export(args):
+    """Export the semantic network to various formats."""
+    # Use the API to export
+    api.export_graph(
+        nodes_dir=args.nodes_dir,
+        edges_file=args.edges_file,
+        output_file=args.output_file,
+        format=args.format
+    )
+    logger.info(f"Exported graph to {args.output_file}")
+
+
+def cmd_pipeline(args):
+    """Run complete pipeline using the fluent API."""
+    # Parse configurations
+    config = json.loads(args.config) if args.config else None
+    llm_config = json.loads(args.llm_config) if args.llm_config else {}
+    
+    # Determine working directory
+    if args.work_dir:
+        work_dir = Path(args.work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        work_dir = Path(tempfile.mkdtemp(prefix="semnet_"))
+        logger.info(f"Using temporary directory: {work_dir}")
+    
+    try:
+        # Use the fluent API for the complete pipeline
+        network = api.SemanticNetwork()
+        
+        # Build pipeline based on arguments
+        pipeline_kwargs = {
+            'max_features': args.max_features if args.embedding_method == 'tfidf' else None,
+            'batch_size': args.batch_size if args.embedding_method == 'tfidf' else None,
+            'provider': args.llm_provider if args.embedding_method == 'llm' else None,
+            'config': llm_config if args.embedding_method == 'llm' else None,
+        }
+        # Remove None values
+        pipeline_kwargs = {k: v for k, v in pipeline_kwargs.items() if v is not None}
+        
+        # Run pipeline
+        network.import_data(args.integration, args.source, config=config) \
+               .save_nodes(work_dir / 'nodes') \
+               .generate_embeddings(method=args.embedding_method, **pipeline_kwargs) \
+               .save_embeddings(work_dir / 'embeddings') \
+               .compute_edges(threshold=args.threshold) \
+               .save_edges(work_dir / 'edges.json') \
+               .export(args.output, format=args.format)
+        
+        logger.info(f"Pipeline complete! Output: {args.output}")
+        
+    finally:
+        # Cleanup if not keeping temp files
+        if not args.keep_temp and not args.work_dir:
+            logger.info(f"Cleaning up temporary directory: {work_dir}")
+            shutil.rmtree(work_dir)
+        elif args.keep_temp or args.work_dir:
+            logger.info(f"Working directory preserved at: {work_dir}")
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        prog='semnet',
+        description='Semantic Network Generator - Build knowledge graphs from various data sources'
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # List command
+    parser_list = subparsers.add_parser('list', help='List available integrations')
+    
+    # Import command
+    parser_import = subparsers.add_parser('import', help='Import data from a source')
+    parser_import.add_argument('-i', '--integration', required=True, help='Integration to use')
+    parser_import.add_argument('-s', '--source', required=True, help='Source path/URL')
+    parser_import.add_argument('-o', '--output-dir', required=True, help='Output directory for nodes')
+    parser_import.add_argument('-c', '--config', help='JSON configuration for the integration')
+    parser_import.add_argument('--extract-edges', action='store_true', 
+                              help='Extract edges during import')
+    
+    # Embed command
+    parser_embed = subparsers.add_parser('embed', help='Generate embeddings for nodes')
+    parser_embed.add_argument('-i', '--input-dir', required=True, help='Input directory with nodes')
+    parser_embed.add_argument('-o', '--output-dir', required=True, help='Output directory for embeddings')
+    parser_embed.add_argument('--integration', required=True, help='Integration for content extraction')
+    parser_embed.add_argument('-m', '--method', choices=['tfidf', 'llm'], default='tfidf',
+                             help='Embedding method')
+    
+    # TF-IDF options
+    parser_embed.add_argument('--max-features', type=int, default=5000,
+                             help='Max features for TF-IDF')
+    parser_embed.add_argument('--batch-size', type=int, default=100,
+                             help='Batch size for TF-IDF')
+    
+    # LLM options
+    parser_embed.add_argument('--llm-provider', default='ollama',
+                             help='LLM provider (ollama, openai, anthropic, etc.)')
+    parser_embed.add_argument('--llm-config', help='JSON configuration for LLM provider')
+    parser_embed.add_argument('--chunk-size', type=int, default=0,
+                             help='Chunk size for text splitting (0 = no chunking)')
+    parser_embed.add_argument('--chunk-overlap', type=int, default=50,
+                             help='Overlap between chunks')
+    
+    # Edges command
+    parser_edges = subparsers.add_parser('edges', help='Generate edges from embeddings')
+    parser_edges.add_argument('-i', '--input-dir', required=True, help='Input directory with embeddings')
+    parser_edges.add_argument('-o', '--output-file', required=True, help='Output file for edges')
+    parser_edges.add_argument('-t', '--threshold', type=float, default=0.7,
+                              help='Similarity threshold for edges')
+    
+    # Export command
+    parser_export = subparsers.add_parser('export', help='Export graph to various formats')
+    parser_export.add_argument('-n', '--nodes-dir', required=True, help='Directory with nodes')
+    parser_export.add_argument('-e', '--edges-file', required=True, help='File with edges')
+    parser_export.add_argument('-o', '--output-file', required=True, help='Output file')
+    parser_export.add_argument('-f', '--format', choices=['gexf', 'graphml', 'gml', 'json'],
+                               default='gexf', help='Export format')
+    
+    # Pipeline command
+    parser_pipeline = subparsers.add_parser('pipeline', 
+                                           help='Run complete pipeline: import → embed → edges → export')
+    parser_pipeline.add_argument('source', help='Source path/URL')
+    parser_pipeline.add_argument('output', help='Output file')
+    parser_pipeline.add_argument('-i', '--integration', required=True, help='Integration to use')
+    parser_pipeline.add_argument('-f', '--format', choices=['gexf', 'graphml', 'gml', 'json'],
+                                 default='gexf', help='Export format')
+    parser_pipeline.add_argument('-m', '--embedding-method', choices=['tfidf', 'llm'],
+                                 default='tfidf', help='Embedding method')
+    parser_pipeline.add_argument('--llm-provider', default='ollama',
+                                 help='LLM provider for embeddings')
+    parser_pipeline.add_argument('--llm-config', help='JSON configuration for LLM provider')
+    parser_pipeline.add_argument('-t', '--threshold', type=float, default=0.7,
+                                 help='Similarity threshold for edges')
+    parser_pipeline.add_argument('-c', '--config', help='JSON configuration for the integration')
+    parser_pipeline.add_argument('--work-dir', help='Working directory (default: temp directory)')
+    parser_pipeline.add_argument('--keep-temp', action='store_true',
+                                 help='Keep temporary files')
+    parser_pipeline.add_argument('--max-features', type=int, default=5000,
+                                 help='Max features for TF-IDF')
+    parser_pipeline.add_argument('--batch-size', type=int, default=100,
+                                 help='Batch size for TF-IDF')
+    
     args = parser.parse_args()
     
-    if args.command == "node-embeddings":
-        if not os.path.isdir(args.input_dir):
-            logging.error(f"Input directory does not exist or is not a directory: {args.input_dir}")
-            sys.exit(1)
-
-        # Select embedding function
-        if args.embedding_method == "llm":
-            from embedding.llm_embedding_model import get_llm_embedding as embedding_fn
-        elif args.embedding_method == "tfidf":
-            from embedding.tdidf_embedding_model import TfidfVectorizer
-            # Gather all docs for fitting
-            file_paths = glob.glob(os.path.join(args.input_dir, "*.json"))
-            docs = []
-            for file_path in file_paths:
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        json_doc = json.load(f)
-                except Exception as e:
-                    print(f"Error loading JSON from {file_path}: {e}")
-                    continue
-                msgs = json_doc['messages']
-                # Use the same transcript logic as in chunked
-                from networks import messages_to_transcript
-                valid_roles = args.valid_roles.split(",") if args.valid_roles else None
-                content = messages_to_transcript(msgs, valid_roles=valid_roles)
-                docs.append(content)
-            vectorizer = TfidfVectorizer()
-            vectorizer.fit(docs)
-            embedding_fn = vectorizer.get_tfidf_embedding
-        else:
-            logging.error("Unknown embedding method.")
-            sys.exit(1)
-
-        if args.method == "chunked":
-            valid_roles = args.valid_roles.split(",") if args.valid_roles else None
-            networks.generate_node_embeddings_chunking(
-                path=args.input_dir,
-                embedding_fn=embedding_fn,
-                embedding_root=args.embedding_root,
-                chunk_size=args.chunk_size,
-                overlap=args.chunk_overlap,
-                aggregation=args.chunk_aggregation,
-                valid_roles=valid_roles
-            )
-        elif args.method == "role-aggregate":
-            # Determine role config
-            if args.role_config:
-                try:
-                    if os.path.isfile(args.role_config):
-                        with open(args.role_config, "r") as f:
-                            role_config = json.load(f)
-                    else:
-                        role_config = json.loads(args.role_config)
-                except Exception:
-                    role_config = ast.literal_eval(args.role_config)
-            else:
-                role_config = {
-                    "user": {"weight": args.user_weight, "aggregate": "mean"},
-                    "assistant": {"weight": args.assistant_weight, "aggregate": "mean"},
-                }
-            networks.generate_node_embeddings_role_aggregate(
-                input_dir=args.input_dir,
-                embedding_fn=embedding_fn,
-                role_config=role_config,
-                embedding_key=args.embedding_root,
-                chunk_size=args.chunk_size,
-                chunk_overlap=args.chunk_overlap,
-                chunk_aggregation=args.chunk_aggregation
-            )
-
-    elif args.command == "normalize":
-        if not os.path.isdir(args.input_dir):
-            logging.error(f"Input directory does not exist or is not a directory: {args.input_dir}")
-            sys.exit(1)
-        if args.output_dir is None or os.path.abspath(args.output_dir) == os.path.abspath(args.input_dir):
-            print("WARNING: You are about to overwrite files in-place in", args.input_dir)
-            confirm = input("Proceed with in-place normalization? [y/N]: ")
-            if confirm.lower() != "y":
-                print("Aborting normalization.")
-                sys.exit(1)
-        normalize_node_embeddings(args.input_dir, args.output_dir, embedding_root=args.embedding_root)
-
-    elif args.command == "edges":
-        if not os.path.isdir(args.input_dir):
-            logging.error(f"Input directory does not exist or is not a directory: {args.input_dir}")
-            sys.exit(1)
-        generate_edges_from_node_embeddings(args.input_dir, args.output_file,
-                                            embedding_root=args.embedding_root,
-                                            embedding_type=args.embedding_type)
-
-    elif args.command == "cut-off":
-        filter_edges(args.input_file, args.output_file, args.cutoff)
-
-    elif args.command == "export":
-        export_to_network_format(args.nodes_dir, args.edges_file, args.format, args.output_file)
-
-    elif args.command == "edge-rescale":
-        with open(args.input, "r", encoding="utf-8") as f:
-            edges = json.load(f)
-
-        # Normalize edge scores to the specified range
-        min_score = min(edge[2] for edge in edges)
-        max_score = max(edge[2] for edge in edges)
-        range_score = max_score - min_score
-        rescaled_edges = [
-            (edge[0], edge[1], ((edge[2] - min_score) / range_score) * (args.max - args.min) + args.min)
-            for edge in edges
-        ]
-
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(rescaled_edges, f, ensure_ascii=False, indent=2)
-            
-    elif args.command == "is-normalized":
-        if not os.path.isdir(args.input_dir):
-            logging.error(f"Input directory does not exist or is not a directory: {args.input_dir}")
-            sys.exit(1)
-        check_embeddings_normalized(args.input_dir, args.tol, embedding_root=args.embedding_root)
-
-    elif args.command == "clean-embeddings":
-        if not os.path.isdir(args.input_dir):
-            logging.error(f"Input directory does not exist or is not a directory: {args.input_dir}")
-            sys.exit(1)
-        clean_embeddings(args.input_dir, args.embedding_root, args.embedding_type)
-
-    elif args.command == "test-chunking":
-        if args.text:
-            text = args.text
-        elif args.file:
-            # Check if it's a JSON file
-            if args.file.endswith(".json"):
-                with open(args.file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                # Import the transcript utility
-                from networks import messages_to_transcript
-                msgs = data.get("messages", [])
-                text = messages_to_transcript(msgs)
-            else:
-                with open(args.file, "r", encoding="utf-8") as f:
-                    text = f.read()
-        else:
-            print("Please provide --text or --file.")
-            sys.exit(1)
-        chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)
-        print(f"Total chunks: {len(chunks)}")
-        for i, chunk in enumerate(chunks):
-            print(f"\n--- Chunk {i+1} ---\n`{chunk}`\n")
-        
-    elif args.command == "validate-json":
-        validate_json_files(args.input_dir)
-        
-    else:
+    if not args.command:
         parser.print_help()
+        sys.exit(1)
+    
+    # Route to appropriate command
+    commands = {
+        'list': cmd_list_integrations,
+        'import': cmd_import,
+        'embed': cmd_embed,
+        'edges': cmd_edges,
+        'export': cmd_export,
+        'pipeline': cmd_pipeline
+    }
+    
+    try:
+        commands[args.command](args)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
